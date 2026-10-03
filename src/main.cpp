@@ -1,12 +1,8 @@
 #include <Arduino.h>
-#include <Adafruit_GC9A01A.h>
-#include <Fonts/FreeSans9pt7b.h>
-#include <Fonts/FreeSansBold9pt7b.h>
-#include <Fonts/FreeSansBold18pt7b.h>
+#include <TFT_eSPI.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
-#include <SPI.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -38,7 +34,7 @@ constexpr unsigned long WIFI_RETRY_MS = 30UL * 1000UL;
 constexpr unsigned long ANIMATION_INTERVAL_MS = 120;
 constexpr uint16_t SCREEN_BACKGROUND = 0x0841;
 
-Adafruit_GC9A01A display(TFT_CS, TFT_DC, TFT_RST);
+TFT_eSPI display;
 Preferences preferences;
 WebServer server(80);
 
@@ -124,17 +120,15 @@ String urlEncode(const String &value) {
 }
 
 void centeredText(const String &text, int16_t y, uint8_t size, uint16_t color) {
-  int16_t x1, y1;
-  uint16_t width, height;
   const GFXfont *font = &FreeSans9pt7b;
   if (size == 2) font = &FreeSansBold9pt7b;
   if (size >= 4) font = &FreeSansBold18pt7b;
-  display.setFont(font);
-  display.setTextSize(1);
+  display.setFreeFont(font);
   display.setTextColor(color);
 
   String rendered = text;
-  display.getTextBounds(rendered, 0, 0, &x1, &y1, &width, &height);
+  uint16_t width = display.textWidth(rendered);
+  const uint16_t height = display.fontHeight();
   const int16_t centerY = y + height / 2;
   const int16_t distanceToCenter = abs(centerY - 120);
   const uint16_t maxWidth = distanceToCenter < 116
@@ -143,10 +137,10 @@ void centeredText(const String &text, int16_t y, uint8_t size, uint16_t color) {
   while (width > maxWidth && rendered.length() > 4) {
     rendered.remove(rendered.length() - 4);
     rendered += "...";
-    display.getTextBounds(rendered, 0, 0, &x1, &y1, &width, &height);
+    width = display.textWidth(rendered);
   }
-  display.setCursor((240 - width) / 2 - x1, y - y1);
-  display.print(rendered);
+  display.setTextDatum(TC_DATUM);
+  display.drawString(rendered, 120, y);
 }
 
 String weatherDescription(int code) {
@@ -474,10 +468,9 @@ void setup() {
   Serial.begin(115200);
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
-  SPI.begin(TFT_SCLK, -1, TFT_MOSI, TFT_CS);
-  display.begin();
+  display.init();
   display.setRotation(0);
-  display.setTextWrap(false);
+  display.setTextWrap(false, false);
   drawMessage("Iniciando", "Clima ESP32");
 
   loadSettings();

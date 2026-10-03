@@ -2,6 +2,8 @@
 
 Proyecto para mostrar el tiempo actual en una pantalla TFT redonda GC9A01 de 1,28 pulgadas (240 x 240). Incluye una interfaz web para configurar la red Wi-Fi y la localidad, sin necesidad de una clave de API meteorológica.
 
+Esta rama experimental usa **TFT_eSPI** como controlador gráfico en lugar de Adafruit GFX. La configuración del GC9A01, los pines y la frecuencia SPI se encuentran en `platformio.ini`.
+
 ## Material
 
 - ESP32 DevKit V1
