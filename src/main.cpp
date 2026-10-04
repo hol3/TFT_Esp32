@@ -215,12 +215,12 @@ String weatherDescription(int code) {
   return "Sin datos";
 }
 
-// PNGdec necesita el fondo en RGB888 para mezclar correctamente el canal alfa.
+// PNGdec usa el orden 00BBGGRR para mezclar correctamente el canal alfa.
 uint32_t rgb565ToRgb888(uint16_t color) {
   const uint8_t red = ((color >> 11) & 0x1F) * 255 / 31;
   const uint8_t green = ((color >> 5) & 0x3F) * 255 / 63;
   const uint8_t blue = (color & 0x1F) * 255 / 31;
-  return (static_cast<uint32_t>(red) << 16) | (static_cast<uint32_t>(green) << 8) | blue;
+  return (static_cast<uint32_t>(blue) << 16) | (static_cast<uint32_t>(green) << 8) | red;
 }
 
 // Callback invocado por PNGdec una vez por cada fila decodificada del icono.
