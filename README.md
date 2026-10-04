@@ -4,6 +4,8 @@ Proyecto para mostrar el tiempo actual en una pantalla TFT redonda GC9A01 de 1,2
 
 Esta rama experimental usa **TFT_eSPI** como controlador gráfico en lugar de Adafruit GFX. La configuración del GC9A01, los pines y la frecuencia SPI se encuentran en `platformio.ini`.
 
+Los iconos PNG de `src/images/icons` se incrustan automáticamente en el firmware durante la compilación. No es necesario ejecutar `uploadfs`; al cargar `firmware.bin` también se cargan todos los recursos gráficos.
+
 ## Material
 
 - ESP32 DevKit V1

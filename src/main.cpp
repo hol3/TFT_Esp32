@@ -1,13 +1,27 @@
+/*
+ * Estacion meteorologica para ESP32 y pantalla redonda GC9A01.
+ *
+ * Flujo principal:
+ * 1. El ESP32 crea el punto de acceso Clima-ESP32 y un servidor web.
+ * 2. El usuario configura Wi-Fi y localidad desde 192.168.4.1.
+ * 3. Open-Meteo convierte la localidad en coordenadas y entrega el clima.
+ * 4. TFT_eSPI muestra textos e iconos PNG embebidos en el firmware.
+ * 5. loop() anima el icono, actualiza el clima y recupera el Wi-Fi.
+ */
+
+// Bibliotecas del framework y de los servicios usados por el proyecto.
 #include <Arduino.h>
 #include <TFT_eSPI.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <PNGdec.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <time.h>
 
+// Valores de respaldo. Normalmente estos pines llegan desde platformio.ini.
 #ifndef TFT_MOSI
 #define TFT_MOSI 23
 #endif
@@ -27,46 +41,81 @@
 #define TFT_BL 17
 #endif
 
+// Datos del punto de acceso y periodos de las tareas expresados en milisegundos.
 constexpr char AP_SSID[] = "Clima-ESP32";
 constexpr char AP_PASSWORD[] = "clima1234";
 constexpr unsigned long WEATHER_INTERVAL_MS = 15UL * 60UL * 1000UL;
 constexpr unsigned long WIFI_RETRY_MS = 30UL * 1000UL;
-constexpr unsigned long ANIMATION_INTERVAL_MS = 120;
+constexpr unsigned long ANIMATION_INTERVAL_MS = 240;
 constexpr uint16_t SCREEN_BACKGROUND = 0x0841;
 
+// Objetos compartidos para pantalla, PNG, memoria no volatil y servidor HTTP.
 TFT_eSPI display;
+PNG pngDecoder;
 Preferences preferences;
 WebServer server(80);
 
+// PlatformIO crea dos simbolos por PNG: inicio y final de sus datos en flash.
+#define EMBEDDED_PNG(name, symbol)                                                                     \
+  extern const uint8_t name##Start[] asm("_binary_src_images_icons_" symbol "_start");                 \
+  extern const uint8_t name##End[] asm("_binary_src_images_icons_" symbol "_end")
+
+EMBEDDED_PNG(iconCloud, "icons8_cloud_48_png");
+EMBEDDED_PNG(iconNight, "icons8_night_48_png");
+EMBEDDED_PNG(iconPartlyCloudy, "icons8_partly_cloudy_day_48_png");
+EMBEDDED_PNG(iconSnow, "icons8_snow_48_png");
+EMBEDDED_PNG(iconSnowStorm, "icons8_snow_storm_48_png");
+EMBEDDED_PNG(iconSnowySunny, "icons8_snowy_sunny_day_48_png");
+EMBEDDED_PNG(iconStorm, "icons8_storm_48_png");
+EMBEDDED_PNG(iconSun, "icons8_sun_48_png");
+EMBEDDED_PNG(iconUmbrella, "icons8_umbrella_48_png");
+EMBEDDED_PNG(iconWindy, "icons8_windy_weather_48_png");
+
+// Configuracion persistente introducida por el usuario desde la pagina web.
 struct Settings {
-  String ssid;
-  String password;
-  String location;
-  double latitude = 0;
-  double longitude = 0;
-  bool hasCoordinates = false;
+  String ssid;                 // Nombre de la red a la que se conecta el ESP32.
+  String password;             // Contrasena de esa red.
+  String location;             // Texto buscado en el servicio de geocodificacion.
+  double latitude = 0;         // Coordenada resuelta por Open-Meteo.
+  double longitude = 0;        // Coordenada resuelta por Open-Meteo.
+  bool hasCoordinates = false; // Evita geocodificar en cada actualizacion.
 } settings;
 
+// Ultima observacion meteorologica valida recibida desde Open-Meteo.
 struct Weather {
-  float temperature = 0;
-  float apparent = 0;
-  float humidity = 0;
-  float wind = 0;
-  float minTemperature = 0;
-  float maxTemperature = 0;
-  int code = -1;
-  int utcOffset = 0;
-  bool valid = false;
-  String error;
+  float temperature = 0;      // Temperatura actual en grados Celsius.
+  float apparent = 0;         // Sensacion termica, disponible para futuras vistas.
+  float humidity = 0;         // Humedad relativa en porcentaje.
+  float wind = 0;             // Velocidad del viento en km/h.
+  float minTemperature = 0;   // Minima prevista para hoy.
+  float maxTemperature = 0;   // Maxima prevista para hoy.
+  int code = -1;              // Codigo WMO que identifica el estado del cielo.
+  int utcOffset = 0;          // Desfase horario de la localidad en segundos.
+  bool isDay = true;          // Permite alternar entre los iconos de sol y luna.
+  bool valid = false;         // Indica si ya existe una respuesta util.
+  String error;               // Ultimo error visible en pantalla y pagina web.
 } weather;
 
+// Marcas de tiempo para ejecutar tareas sin bloquear el bucle principal.
 unsigned long lastWeatherUpdate = 0;
 unsigned long lastWifiAttempt = 0;
 unsigned long lastAnimationUpdate = 0;
+
+// Estado de la animacion y de la vista actualmente mostrada.
 uint16_t animationFrame = 0;
 uint16_t currentBackground = SCREEN_BACKGROUND;
 bool showingWeather = false;
+int16_t iconX = 96;
+int16_t iconY = 51;
+uint16_t pngLineBuffer[48]; // Una fila RGB565 del icono de 48 pixeles.
 
+// Rango de memoria ocupado por un archivo PNG embebido.
+struct EmbeddedImage {
+  const uint8_t *start;
+  const uint8_t *end;
+};
+
+// Pagina de configuracion guardada en flash para no consumir RAM permanente.
 const char PAGE_HTML[] PROGMEM = R"HTML(
 <!doctype html><html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -94,6 +143,7 @@ small{display:block;margin-top:17px;color:#80938e;text-align:center}.place{color
 <small>Conectado al punto de acceso <span class="place">Clima-ESP32</span> · 192.168.4.1</small></main></body></html>
 )HTML";
 
+// Escapa caracteres con significado HTML antes de insertar valores del usuario.
 String htmlEscape(String value) {
   value.replace("&", "&amp;");
   value.replace("\"", "&quot;");
@@ -102,12 +152,14 @@ String htmlEscape(String value) {
   return value;
 }
 
+// Convierte texto UTF-8 a formato porcentual para usarlo en una URL.
 String urlEncode(const String &value) {
   const char hex[] = "0123456789ABCDEF";
   String result;
-  result.reserve(value.length() * 3);
+  result.reserve(value.length() * 3); // El peor caso usa tres caracteres: %XX.
   for (size_t i = 0; i < value.length(); ++i) {
     const uint8_t c = static_cast<uint8_t>(value[i]);
+    // RFC 3986 permite estos caracteres sin codificarlos.
     if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
       result += static_cast<char>(c);
     } else {
@@ -119,7 +171,12 @@ String urlEncode(const String &value) {
   return result;
 }
 
+/*
+ * Dibuja texto centrado y lo recorta con puntos suspensivos si invade el borde.
+ * El ancho disponible es la cuerda de un circulo de radio 116 en la altura Y.
+ */
 void centeredText(const String &text, int16_t y, uint8_t size, uint16_t color) {
+  // La interfaz conserva una API sencilla de tres niveles tipograficos.
   const GFXfont *font = &FreeSans9pt7b;
   if (size == 2) font = &FreeSansBold9pt7b;
   if (size >= 4) font = &FreeSansBold18pt7b;
@@ -131,6 +188,7 @@ void centeredText(const String &text, int16_t y, uint8_t size, uint16_t color) {
   const uint16_t height = display.fontHeight();
   const int16_t centerY = y + height / 2;
   const int16_t distanceToCenter = abs(centerY - 120);
+  // Teorema de Pitagoras: ancho = 2 * sqrt(radio^2 - distancia^2).
   const uint16_t maxWidth = distanceToCenter < 116
                                 ? 2 * sqrt(116L * 116L - distanceToCenter * distanceToCenter) - 10
                                 : 0;
@@ -143,6 +201,7 @@ void centeredText(const String &text, int16_t y, uint8_t size, uint16_t color) {
   display.drawString(rendered, 120, y);
 }
 
+// Traduce los codigos meteorologicos WMO a descripciones breves en espanol.
 String weatherDescription(int code) {
   if (code == 0) return "Despejado";
   if (code <= 3) return "Parcial nublado";
@@ -156,84 +215,62 @@ String weatherDescription(int code) {
   return "Sin datos";
 }
 
-void drawCloud(int x, int y, uint16_t color) {
-  display.fillCircle(x, y + 7, 14, color);
-  display.fillCircle(x + 17, y, 18, color);
-  display.fillCircle(x + 36, y + 8, 13, color);
-  display.fillRoundRect(x - 1, y + 7, 49, 20, 9, color);
+// PNGdec necesita el fondo en RGB888 para mezclar correctamente el canal alfa.
+uint32_t rgb565ToRgb888(uint16_t color) {
+  const uint8_t red = ((color >> 11) & 0x1F) * 255 / 31;
+  const uint8_t green = ((color >> 5) & 0x3F) * 255 / 63;
+  const uint8_t blue = (color & 0x1F) * 255 / 31;
+  return (static_cast<uint32_t>(red) << 16) | (static_cast<uint32_t>(green) << 8) | blue;
 }
 
-void drawWeatherIcon(int code, uint16_t frame) {
-  constexpr uint16_t yellow = 0xFEC0;
-  constexpr uint16_t cloud = 0xD69A;
-  constexpr uint16_t rain = 0x3DDF;
-  const int cx = 120;
-  const int cy = 75;
-  const int cloudOffset = round(sin(frame * 0.18) * 2.0);
+// Callback invocado por PNGdec una vez por cada fila decodificada del icono.
+int drawPngLine(PNGDRAW *line) {
+  // Convierte la fila a RGB565 y sustituye la transparencia por el fondo actual.
+  pngDecoder.getLineAsRGB565(line, pngLineBuffer, PNG_RGB565_BIG_ENDIAN,
+                             rgb565ToRgb888(currentBackground));
+  // Enviar una sola fila mantiene el consumo de RAM bajo.
+  display.pushImage(iconX, iconY + line->y, line->iWidth, 1, pngLineBuffer);
+  return 1;
+}
 
-  if (code == 0) {
-    display.fillCircle(cx, cy, 22 + ((frame / 5) % 2), yellow);
-    for (int angle = 0; angle < 360; angle += 45) {
-      const float radians = (angle + frame * 4) * PI / 180.0;
-      display.drawLine(cx + cos(radians) * 31, cy + sin(radians) * 31,
-                       cx + cos(radians) * 40, cy + sin(radians) * 40, yellow);
-    }
-    return;
+// Asocia el codigo WMO, el momento del dia y el viento con un PNG embebido.
+EmbeddedImage selectWeatherIcon(int code) {
+  // Los fenomenos mas severos se comprueban primero para darles prioridad.
+  if (code >= 95) return {iconStormStart, iconStormEnd};
+  if (code >= 85 && code <= 86) return {iconSnowStormStart, iconSnowStormEnd};
+  if (code >= 71 && code <= 77) {
+    return weather.isDay ? EmbeddedImage{iconSnowySunnyStart, iconSnowySunnyEnd}
+                         : EmbeddedImage{iconSnowStart, iconSnowEnd};
   }
-
-  if (code >= 95) {
-    drawCloud(94 + cloudOffset, 55, cloud);
-    const uint16_t boltColor = frame % 12 < 3 ? 0xFFFF : yellow;
-    display.fillTriangle(122, 83, 109, 108, 122, 105, boltColor);
-    display.fillTriangle(122, 103, 113, 114, 135, 96, boltColor);
-    return;
-  }
-
   if ((code >= 51 && code <= 67) || (code >= 80 && code <= 82)) {
-    drawCloud(94 + cloudOffset, 54, cloud);
-    for (int index = 0; index < 3; ++index) {
-      const int x = 101 + index * 18;
-      const int y = 89 + ((frame * 3 + index * 7) % 17);
-      display.drawLine(x, y, x - 4, y + 9, rain);
-    }
-    return;
+    return {iconUmbrellaStart, iconUmbrellaEnd};
   }
-
-  if ((code >= 71 && code <= 77) || (code >= 85 && code <= 86)) {
-    drawCloud(94 + cloudOffset, 52, cloud);
-    for (int index = 0; index < 3; ++index) {
-      const int x = 103 + index * 17 + ((frame + index) % 3) - 1;
-      const int y = 91 + ((frame * 2 + index * 7) % 18);
-      display.drawLine(x - 3, y, x + 3, y, 0xFFFF);
-      display.drawLine(x, y - 3, x, y + 3, 0xFFFF);
-    }
-    return;
+  if (weather.wind >= 30 && code <= 3) return {iconWindyStart, iconWindyEnd};
+  if (code == 0) {
+    return weather.isDay ? EmbeddedImage{iconSunStart, iconSunEnd}
+                         : EmbeddedImage{iconNightStart, iconNightEnd};
   }
+  if (code == 1 || code == 2) return {iconPartlyCloudyStart, iconPartlyCloudyEnd};
+  return {iconCloudStart, iconCloudEnd};
+}
 
-  if (code == 45 || code == 48) {
-    drawCloud(94 + cloudOffset, 48, cloud);
-    const int fogOffset = frame % 12;
-    display.drawFastHLine(82 + fogOffset, 88, 65, cloud);
-    display.drawFastHLine(92 - fogOffset, 98, 65, cloud);
-    display.drawFastHLine(82 + fogOffset, 108, 65, cloud);
-    return;
-  }
-
-  if (code > 0 && code <= 2) {
-    display.fillCircle(101, 62, 18, yellow);
-    for (int angle = 0; angle < 360; angle += 90) {
-      const float radians = (angle + frame * 5) * PI / 180.0;
-      display.drawLine(101 + cos(radians) * 22, 62 + sin(radians) * 22,
-                       101 + cos(radians) * 28, 62 + sin(radians) * 28, yellow);
-    }
-    drawCloud(101 + cloudOffset, 62, cloud);
-  } else {
-    drawCloud(95 + cloudOffset, 57, cloud);
+// Decodifica y dibuja el icono con un desplazamiento sinusoidal suave.
+void drawWeatherIcon(int code, uint16_t frame) {
+  const EmbeddedImage image = selectWeatherIcon(code);
+  // Las dos frecuencias distintas producen un movimiento menos mecanico.
+  iconX = 96 + round(sin(frame * 0.20) * 2.0);
+  iconY = 51 + round(sin(frame * 0.14) * 2.0);
+  const size_t imageSize = image.end - image.start;
+  // openFLASH lee directamente el PNG incluido en firmware.bin.
+  if (pngDecoder.openFLASH(const_cast<uint8_t *>(image.start), imageSize, drawPngLine) == PNG_SUCCESS) {
+    pngDecoder.decode(nullptr, 0);
+    pngDecoder.close();
   }
 }
 
+// Selecciona un fondo RGB565 relacionado con el estado meteorologico actual.
 uint16_t weatherBackground(int code) {
-  if (code == 0) return 0x1375;                              // Cielo azul
+  if (code == 0) return weather.isDay ? 0x1375 : 0x0864;     // Dia o noche
   if (code >= 95) return 0x20A7;                            // Tormenta purpura
   if (code == 45 || code == 48) return 0x5B2D;              // Niebla gris
   if ((code >= 71 && code <= 77) || (code >= 85 && code <= 86)) return 0x53F2;
@@ -242,6 +279,7 @@ uint16_t weatherBackground(int code) {
   return SCREEN_BACKGROUND;
 }
 
+// Conserva solo el nombre principal para que la localidad quepa en el circulo.
 String shortLocation() {
   String value = settings.location;
   const int comma = value.indexOf(',');
@@ -250,12 +288,13 @@ String shortLocation() {
   return value;
 }
 
+// Compone la vista completa cada vez que llegan nuevos datos meteorologicos.
 void drawWeather() {
   currentBackground = weatherBackground(weather.code);
   showingWeather = true;
   display.fillScreen(currentBackground);
   centeredText(shortLocation(), 19, 2, 0xBDF7);
-  animationFrame = 0;
+  animationFrame = 0; // Toda condicion nueva comienza desde el primer fotograma.
   drawWeatherIcon(weather.code, animationFrame);
 
   char temperature[12];
@@ -270,8 +309,9 @@ void drawWeather() {
   centeredText(details, 207, 1, 0xBDF7);
 }
 
+// Muestra estados transitorios como conexion, actualizacion o errores.
 void drawMessage(const String &title, const String &line1, const String &line2 = "") {
-  showingWeather = false;
+  showingWeather = false; // Pausa la animacion mientras esta vista es visible.
   display.fillScreen(SCREEN_BACKGROUND);
   centeredText(title, 61, 2, 0xFEC0);
   centeredText(line1, 105, 1, 0xFFFF);
@@ -280,16 +320,22 @@ void drawMessage(const String &title, const String &line1, const String &line2 =
   centeredText("192.168.4.1", 183, 1, 0xBDF7);
 }
 
+/*
+ * Ejecuta una peticion HTTPS y deserializa su respuesta JSON.
+ * Devuelve false y rellena `error` ante cualquier fallo de red o contenido.
+ */
 bool getJson(const String &url, JsonDocument &document, String &error) {
   WiFiClientSecure client;
+  // Los datos son publicos; se omite validar el certificado para ahorrar flash.
   client.setInsecure();
   HTTPClient http;
-  http.setTimeout(12000);
+  http.setTimeout(12000); // Evita bloquear indefinidamente si la API no responde.
   if (!http.begin(client, url)) {
     error = "No se pudo iniciar HTTPS";
     return false;
   }
   http.addHeader("Accept", "application/json");
+  // El ESP32 puede leer esta respuesta sin implementar descompresion gzip.
   http.addHeader("Accept-Encoding", "identity");
   const int status = http.GET();
   if (status != HTTP_CODE_OK) {
@@ -308,6 +354,7 @@ bool getJson(const String &url, JsonDocument &document, String &error) {
     return false;
   }
 
+  // ArduinoJson crea un arbol consultable directamente desde la respuesta.
   const DeserializationError jsonError = deserializeJson(document, payload);
   if (jsonError) {
     error = "JSON: " + String(jsonError.c_str());
@@ -318,6 +365,7 @@ bool getJson(const String &url, JsonDocument &document, String &error) {
   return true;
 }
 
+// Resuelve el texto de la localidad a latitud y longitud mediante Open-Meteo.
 bool findCoordinates() {
   JsonDocument document;
   String error;
@@ -327,7 +375,7 @@ bool findCoordinates() {
     weather.error = error;
     return false;
   }
-  JsonObject result = document["results"][0];
+  JsonObject result = document["results"][0]; // Se usa la coincidencia principal.
   if (result.isNull()) {
     weather.error = "Localidad no encontrada";
     return false;
@@ -335,48 +383,55 @@ bool findCoordinates() {
   settings.latitude = result["latitude"].as<double>();
   settings.longitude = result["longitude"].as<double>();
   settings.hasCoordinates = true;
+  // Guardar las coordenadas reduce peticiones y acelera los siguientes arranques.
   preferences.putDouble("lat", settings.latitude);
   preferences.putDouble("lon", settings.longitude);
   preferences.putBool("hasCoord", true);
   return true;
 }
 
+// Descarga la observacion actual y el minimo/maximo diario de Open-Meteo.
 bool updateWeather() {
   if (WiFi.status() != WL_CONNECTED) {
     weather.error = "Sin conexion Wi-Fi";
     return false;
   }
+  // Solo geocodifica si la localidad es nueva o aun no tiene coordenadas.
   if (!settings.hasCoordinates && !findCoordinates()) return false;
 
   JsonDocument document;
   String error;
   const String url = "https://api.open-meteo.com/v1/forecast?latitude=" + String(settings.latitude, 6) +
                      "&longitude=" + String(settings.longitude, 6) +
-                     "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m"
+                     "&current=temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,is_day"
                      "&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto&forecast_days=3";
   if (!getJson(url, document, error)) {
     weather.error = error;
     return false;
   }
 
+  // El operador `|` de ArduinoJson proporciona un valor seguro si falta un campo.
   weather.temperature = document["current"]["temperature_2m"] | 0.0;
   weather.apparent = document["current"]["apparent_temperature"] | 0.0;
   weather.humidity = document["current"]["relative_humidity_2m"] | 0.0;
   weather.wind = document["current"]["wind_speed_10m"] | 0.0;
   weather.code = document["current"]["weather_code"] | -1;
+  weather.isDay = (document["current"]["is_day"] | 1) == 1;
   weather.maxTemperature = document["daily"]["temperature_2m_max"][0] | 0.0;
   weather.minTemperature = document["daily"]["temperature_2m_min"][0] | 0.0;
   weather.utcOffset = document["utc_offset_seconds"] | 0;
   weather.valid = true;
   weather.error = "";
   lastWeatherUpdate = millis();
+  // Sincroniza el reloj con el huso horario que corresponde a la localidad.
   configTime(weather.utcOffset, 0, "pool.ntp.org", "time.nist.gov");
   drawWeather();
   return true;
 }
 
+// Recupera desde NVS la configuracion que sobrevive a reinicios y cortes de luz.
 void loadSettings() {
-  preferences.begin("weather", false);
+  preferences.begin("weather", false); // `false` abre el espacio en lectura/escritura.
   settings.ssid = preferences.getString("ssid", "");
   settings.password = preferences.getString("password", "");
   settings.location = preferences.getString("location", "Madrid, Espana");
@@ -385,20 +440,23 @@ void loadSettings() {
   settings.hasCoordinates = preferences.getBool("hasCoord", false);
 }
 
+// Inicia Wi-Fi y espera como maximo `timeoutMs`, atendiendo la web entretanto.
 bool connectWifi(unsigned long timeoutMs = 15000) {
   if (!settings.ssid.length()) return false;
   WiFi.begin(settings.ssid.c_str(), settings.password.c_str());
   lastWifiAttempt = millis();
   const unsigned long started = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - started < timeoutMs) {
+    // La pagina de configuracion sigue disponible durante el intento de conexion.
     server.handleClient();
     delay(100);
   }
   return WiFi.status() == WL_CONNECTED;
 }
 
+// Construye la pagina principal sustituyendo sus marcadores por valores actuales.
 void handleRoot() {
-  String page = FPSTR(PAGE_HTML);
+  String page = FPSTR(PAGE_HTML); // Copia temporal desde flash para poder modificarla.
   const bool connected = WiFi.status() == WL_CONNECTED;
   String status = connected ? "Conectado a <b>" + htmlEscape(WiFi.SSID()) + "</b> · IP " + WiFi.localIP().toString()
                             : "Sin conexión a Internet. Configura una red Wi-Fi.";
@@ -410,7 +468,9 @@ void handleRoot() {
   server.send(200, "text/html; charset=utf-8", page);
 }
 
+// Valida y guarda el formulario enviado mediante POST a /save.
 void handleSave() {
+  // Rechaza peticiones incompletas antes de modificar la configuracion existente.
   if (!server.hasArg("ssid") || !server.hasArg("location")) {
     server.send(400, "text/plain; charset=utf-8", "Faltan datos obligatorios");
     return;
@@ -425,18 +485,22 @@ void handleSave() {
     return;
   }
 
+  // Estas banderas determinan que recursos deben reconectarse o recalcularse.
   const bool networkChanged = newSsid != settings.ssid || server.arg("password").length();
   const bool locationChanged = !newLocation.equalsIgnoreCase(settings.location);
   settings.ssid = newSsid;
   settings.location = newLocation;
+  // Una contrasena vacia conserva la anterior y evita mostrarla en el formulario.
   if (server.arg("password").length()) settings.password = server.arg("password");
   if (locationChanged) settings.hasCoordinates = false;
 
+  // Preferences escribe estos valores en la memoria no volatil del ESP32.
   preferences.putString("ssid", settings.ssid);
   preferences.putString("password", settings.password);
   preferences.putString("location", settings.location);
   preferences.putBool("hasCoord", settings.hasCoordinates);
 
+  // Patron Post/Redirect/Get: evita reenviar el formulario al recargar la pagina.
   server.sendHeader("Location", "/", true);
   server.send(303, "text/plain", "");
   delay(150);
@@ -454,6 +518,7 @@ void handleSave() {
   }
 }
 
+// Registra las rutas HTTP y redirige cualquier ruta desconocida al formulario.
 void setupWebServer() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
@@ -464,16 +529,19 @@ void setupWebServer() {
   server.begin();
 }
 
+// Arduino ejecuta setup una sola vez despues de encender o reiniciar el ESP32.
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(115200); // Canal de diagnostico visible en el monitor serie.
+  // La retroiluminacion se controla como una salida digital siempre encendida.
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
-  display.init();
+  display.init(); // TFT_eSPI configura SPI y el controlador GC9A01.
   display.setRotation(0);
   display.setTextWrap(false, false);
   drawMessage("Iniciando", "Clima ESP32");
 
   loadSettings();
+  // AP_STA mantiene simultaneamente el portal local y la conexion a Internet.
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_SSID, AP_PASSWORD);
   setupWebServer();
@@ -486,24 +554,30 @@ void setup() {
   }
 }
 
+// Arduino repite loop continuamente despues de completar setup.
 void loop() {
+  // Debe llamarse con frecuencia para responder a navegadores conectados.
   server.handleClient();
 
+  // millis() permite animar sin delay y sin bloquear el servidor web.
   if (weather.valid && showingWeather && millis() - lastAnimationUpdate >= ANIMATION_INTERVAL_MS) {
     lastAnimationUpdate = millis();
     ++animationFrame;
+    // Solo limpia la region del icono para no redibujar ni parpadear toda la vista.
     display.fillRect(68, 34, 104, 84, currentBackground);
     drawWeatherIcon(weather.code, animationFrame);
   }
 
   if (WiFi.status() == WL_CONNECTED) {
+    // Actualiza inmediatamente al arrancar y despues cada quince minutos.
     if (!weather.valid || millis() - lastWeatherUpdate >= WEATHER_INTERVAL_MS) {
       if (!updateWeather() && !weather.valid) drawMessage("Sin datos", weather.error);
     }
   } else if (settings.ssid.length() && millis() - lastWifiAttempt >= WIFI_RETRY_MS) {
+    // Si se pierde la red, reintenta en segundo plano cada treinta segundos.
     WiFi.disconnect();
     WiFi.begin(settings.ssid.c_str(), settings.password.c_str());
     lastWifiAttempt = millis();
   }
-  delay(2);
+  delay(2); // Cede tiempo al sistema Wi-Fi y al planificador del ESP32.
 }
